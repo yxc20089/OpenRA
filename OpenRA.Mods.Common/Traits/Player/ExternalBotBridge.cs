@@ -867,10 +867,7 @@ namespace OpenRA.Mods.Common.Traits
 			// Snapshot actors once at advance start — CheckInterrupts uses cached lists
 			// instead of expensive ActorsHavingTrait calls on every check
 			if (interruptCheckInterval > 0)
-			{
 				SnapshotActors();
-				Console.Error.WriteLine($"[rl-bridge] FastAdvance {n} ticks with interrupt check every {interruptCheckInterval} ticks, {enabledInterrupts.Count} signals, {cachedMobileActors.Count} mobile + {cachedBuildingActors.Count} buildings cached (session {episodeId})");
-			}
 
 			// Set up the TCS before queueing — worker will complete it via ITick.Tick.
 			// Keep a local reference because ITick.Tick nulls the field after completion.

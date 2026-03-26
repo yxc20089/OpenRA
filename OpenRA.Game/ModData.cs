@@ -161,6 +161,12 @@ namespace OpenRA
 
 		public void InitializeLoaders(IReadOnlyFileSystem fileSystem)
 		{
+			// Skip global static reinitialization in headless multi-session mode.
+			// These statics are shared across all sessions — reinitializing them
+			// while other sessions are ticking corrupts their state.
+			if (Game.IsHeadless && Game.IsMultiSession)
+				return;
+
 			// all this manipulation of static crap here is nasty and breaks
 			// horribly when you use ModData in unexpected ways.
 			ChromeMetrics.Initialize(this);

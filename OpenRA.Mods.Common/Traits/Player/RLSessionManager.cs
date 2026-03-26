@@ -35,6 +35,13 @@ namespace OpenRA.Mods.Common.Traits
 		static ModData modData;
 		static readonly object MapCacheLock = new();
 		static readonly object WorldCreateLock = new();
+
+		/// <summary>
+		/// Global tick semaphore: limits concurrent World.Tick() calls across all sessions.
+		/// With IsMultiSession fixes (LongBitSet guard, IsCurrentWorld, InitializeLoaders skip,
+		/// Sound guard), shared state races are eliminated. Allow full parallelism (8 per server).
+		/// </summary>
+		static readonly SemaphoreSlim GlobalTickSemaphore = new(8, 8);
 		static readonly HashSet<string> PreparedMapUids = new();
 
 		/// <summary>Cache resolved MapPreview by map name to avoid repeated MapCache enumeration.</summary>
@@ -89,6 +96,7 @@ namespace OpenRA.Mods.Common.Traits
 		public static void Initialize(ModData md)
 		{
 			modData = md;
+			Game.IsMultiSession = true;
 			ExternalBotBridge.MultiSessionMode = true;
 			Support.PerfHistory.Disabled = true;
 
@@ -126,7 +134,17 @@ namespace OpenRA.Mods.Common.Traits
 					state.TickLock.Wait();
 					try
 					{
-						TickSession(state, item.Bridge);
+						// Global tick limit: OpenRA engine has static state
+						// that crashes with too many concurrent World.Tick() calls.
+						GlobalTickSemaphore.Wait();
+						try
+						{
+							TickSession(state, item.Bridge);
+						}
+						finally
+						{
+							GlobalTickSemaphore.Release();
+						}
 					}
 					finally
 					{
