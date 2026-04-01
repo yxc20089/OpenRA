@@ -145,6 +145,10 @@ namespace OpenRA.Mods.Common.Traits
 					throw new RpcException(new Status(StatusCode.Unavailable,
 						$"Bridge not activated within 300s (session_id={request.SessionId})"));
 
+				// Touch activity timestamp to prevent reaper from cleaning up active sessions
+				if (RLSessionManager.SessionStates.TryGetValue(request.SessionId, out var sessionState))
+					sessionState.TouchActivity();
+
 				return await bridge.RequestFastAdvance(
 					request.Ticks, request.Commands, context.CancellationToken,
 					request.CheckEventsEvery,

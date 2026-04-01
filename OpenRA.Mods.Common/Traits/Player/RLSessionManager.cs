@@ -63,6 +63,12 @@ namespace OpenRA.Mods.Common.Traits
 			/// <summary>Track in-flight work so DestroySession can wait for it to finish.</summary>
 			public volatile WorkItem ActiveWorkItem;
 
+			/// <summary>Last time this session had activity (FastAdvance call). Used by reaper.</summary>
+			public long LastActivityTicks = DateTime.UtcNow.Ticks;
+
+			public void TouchActivity() { LastActivityTicks = DateTime.UtcNow.Ticks; }
+			public TimeSpan IdleTime => DateTime.UtcNow - new DateTime(Interlocked.Read(ref LastActivityTicks));
+
 			public SessionState(OrderManager om, World w)
 			{
 				OrderManager = om;
@@ -115,6 +121,48 @@ namespace OpenRA.Mods.Common.Traits
 			}
 
 			Log.Write("rl-bridge", $"RLSessionManager initialized: {workerCount} workers, queue capacity {workerCount * 4}");
+
+			// Start session reaper: cleans up sessions idle for >5 minutes.
+			// Prevents leaked sessions from exhausting server capacity.
+			var reaper = new Thread(() =>
+			{
+				while (true)
+				{
+					Thread.Sleep(30_000); // Check every 30s
+					try
+					{
+						var maxIdle = TimeSpan.FromMinutes(5);
+						foreach (var kvp in SessionStates)
+						{
+							if (kvp.Value.IdleTime > maxIdle)
+							{
+								Log.Write("rl-bridge", $"Reaping idle session {kvp.Key} (idle {kvp.Value.IdleTime.TotalSeconds:F0}s)");
+								try { DestroySession(kvp.Key); }
+								catch (Exception e) { Log.Write("rl-bridge", $"Reaper error for {kvp.Key}: {e.Message}"); }
+							}
+						}
+
+						// Also clean up orphaned entries in Sessions that have no SessionState
+						foreach (var kvp in ExternalBotBridge.Sessions)
+						{
+							if (!SessionStates.ContainsKey(kvp.Key))
+							{
+								Log.Write("rl-bridge", $"Reaping orphaned session entry {kvp.Key}");
+								kvp.Value.Deactivate();
+							}
+						}
+					}
+					catch (Exception e)
+					{
+						Log.Write("rl-bridge", $"Reaper sweep error: {e.Message}");
+					}
+				}
+			})
+			{
+				IsBackground = true,
+				Name = "RL-Session-Reaper"
+			};
+			reaper.Start();
 		}
 
 		/// <summary>
