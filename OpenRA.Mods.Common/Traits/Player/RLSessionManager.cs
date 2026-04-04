@@ -221,8 +221,8 @@ namespace OpenRA.Mods.Common.Traits
 		internal static WorkItem SubmitWork(SessionState state, ExternalBotBridge bridge)
 		{
 			var item = new WorkItem(state, bridge);
-			if (!workQueue.TryAdd(item, TimeSpan.Zero))
-				return null; // Queue full — caller should return RESOURCE_EXHAUSTED
+			if (!workQueue.TryAdd(item, TimeSpan.FromSeconds(5)))
+				return null; // Queue persistently full — caller should return RESOURCE_EXHAUSTED
 
 			return item;
 		}
@@ -412,8 +412,13 @@ namespace OpenRA.Mods.Common.Traits
 				return;
 			}
 
-			// 2. Load map from disk (per-session — each needs its own Map instance)
-			var map = mapPreview.ToMap();
+			// 2. Load map from disk (per-session — each needs its own Map instance).
+			//    Serialized via MapCacheLock: ToMap() opens the underlying ZipFile package;
+			//    concurrent ToMap() calls on the same MapPreview race on ZipFile.GetEnumerator()
+			//    during ComputeUID, causing ObjectDisposedException.
+			Map map;
+			lock (MapCacheLock)
+				map = mapPreview.ToMap();
 			Log.Write("rl-bridge", $"Session {sessionId}: Map loaded from {mapPreview.Path}, {map.ActorDefinitions.Count()} actor defs");
 
 			// 3. PrepareMap — must run for every map (sprite sequences are map-specific,
