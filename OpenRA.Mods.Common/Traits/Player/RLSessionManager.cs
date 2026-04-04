@@ -413,13 +413,46 @@ namespace OpenRA.Mods.Common.Traits
 			}
 
 			// 2. Load map from disk (per-session — each needs its own Map instance).
-			//    Serialized via MapCacheLock: ToMap() opens the underlying ZipFile package;
-			//    concurrent ToMap() calls on the same MapPreview race on ZipFile.GetEnumerator()
-			//    during ComputeUID, causing ObjectDisposedException.
-			Map map;
-			lock (MapCacheLock)
-				map = mapPreview.ToMap();
-			Log.Write("rl-bridge", $"Session {sessionId}: Map loaded from {mapPreview.Path}, {map.ActorDefinitions.Count()} actor defs");
+			//    MapPreview.package (its ZipFile handle) gets disposed after first Map creation,
+			//    so cached MapPreview entries become stale. Retry up to 3× with cache invalidation:
+			//    evict the stale entry so ResolvedMaps.GetOrAdd re-opens a fresh ZipFile handle.
+			Map map = null;
+			string mapPath = null;
+			for (var attempt = 0; attempt < 3; attempt++)
+			{
+				try
+				{
+					lock (MapCacheLock)
+					{
+						map = mapPreview.ToMap();
+						mapPath = mapPreview.Path;
+					}
+					break;
+				}
+				catch (ObjectDisposedException)
+				{
+					Log.Write("rl-bridge", $"Session {sessionId}: ZipFile disposed on attempt {attempt + 1}, evicting cache entry for '{mapName}'");
+					ResolvedMaps.TryRemove(mapName, out _);
+					// Re-resolve MapPreview with a fresh handle
+					lock (MapCacheLock)
+					{
+						mapPreview = modData.MapCache.FirstOrDefault(m =>
+							m.Status == MapStatus.Available &&
+							(Path.GetFileName(m.Path) == mapName || m.Uid == mapName));
+					}
+					if (mapPreview == null)
+					{
+						Log.Write("rl-bridge", $"Session {sessionId}: Map '{mapName}' not found after cache eviction");
+						return;
+					}
+				}
+			}
+			if (map == null)
+			{
+				Log.Write("rl-bridge", $"Session {sessionId}: Failed to load map '{mapName}' after 3 attempts");
+				return;
+			}
+			Log.Write("rl-bridge", $"Session {sessionId}: Map loaded from {mapPath}, {map.ActorDefinitions.Count()} actor defs");
 
 			// 3. PrepareMap — must run for every map (sprite sequences are map-specific,
 			//    and randomized scenarios produce unique map UIDs every time).
