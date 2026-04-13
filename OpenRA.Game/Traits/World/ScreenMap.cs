@@ -107,6 +107,11 @@ namespace OpenRA.Traits
 
 		public void Add(IEffect effect, WPos position, Size size)
 		{
+			// Headless sessions still tick effects, but they do not create a renderer.
+			// Skip screen-space bookkeeping instead of crashing support-power visuals.
+			if (worldRenderer == null)
+				return;
+
 			var screenPos = worldRenderer.ScreenPxPosition(position);
 			var screenWidth = Math.Abs(size.Width);
 			var screenHeight = Math.Abs(size.Height);
@@ -156,6 +161,9 @@ namespace OpenRA.Traits
 
 		public IEnumerable<FrozenActor> FrozenActorsAtMouse(Player viewer, MouseInput mi)
 		{
+			if (worldRenderer == null)
+				return NoFrozenActors;
+
 			return FrozenActorsAtMouse(viewer, worldRenderer.Viewport.ViewToWorldPx(mi.Location));
 		}
 
@@ -169,6 +177,9 @@ namespace OpenRA.Traits
 
 		public IEnumerable<ActorBoundsPair> ActorsAtMouse(MouseInput mi)
 		{
+			if (worldRenderer == null)
+				return [];
+
 			return ActorsAtMouse(worldRenderer.Viewport.ViewToWorldPx(mi.Location));
 		}
 
