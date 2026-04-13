@@ -366,6 +366,9 @@ namespace OpenRA.Mods.Common.Traits
 			// 5. Build LobbyInfo with map slots and bot assignments
 			SetupLobbyInfo(orderManager, mapPreview, map, bots, seed);
 
+			if (Game.Settings.Server.RecordReplays)
+				connection.StartRecording(() => Game.TimestampedFilename(true, extra: $"-RL-{sessionId}"), orderManager.LobbyInfo);
+
 			// 6. World creation + LoadComplete (serialized — traits access shared state).
 			//    With PrepareMap cached and map lookup cached, the lock only covers
 			//    World construction (~300ms per session). 64 sessions ≈ 19s total.
