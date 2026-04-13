@@ -324,6 +324,8 @@ namespace OpenRA
 
 			if (OrderManager.Connection is NetworkConnection nc && nc.Recorder != null)
 				nc.Recorder.Metadata = new ReplayMetadata(gameInfo);
+			else if (OrderManager.Connection is EchoConnection ec && ec.Recorder != null)
+				ec.Recorder.Metadata = new ReplayMetadata(gameInfo);
 		}
 
 		public void PostLoadComplete(WorldRenderer wr)

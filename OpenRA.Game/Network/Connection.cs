@@ -47,10 +47,59 @@ namespace OpenRA.Network
 		readonly Queue<OrderPacket> immediateOrders = [];
 		bool disposed;
 
+		internal ReplayRecorder Recorder { get; private set; }
+
 		int IConnection.LocalClientId => LocalClientId;
+
+		public void StartRecording(Func<string> chooseFilename, Session lobbyInfo)
+		{
+			Recorder?.Dispose();
+			Recorder = new ReplayRecorder(chooseFilename);
+
+			RecordFakeHandshake();
+
+			if (lobbyInfo != null)
+				Recorder.ReceiveFrame(0, 0, Order.FromTargetString("SyncInfo", lobbyInfo.Serialize(), true).Serialize());
+		}
+
+		void RecordFakeHandshake()
+		{
+			if (Recorder == null)
+				return;
+
+			var request = new HandshakeRequest
+			{
+				Mod = Game.ModData.Manifest.Id,
+				Version = Game.ModData.Manifest.Metadata.Version,
+			};
+
+			Recorder.ReceiveFrame(0, 0, new Order("HandshakeRequest", null, false)
+			{
+				Type = OrderType.Handshake,
+				IsImmediate = true,
+				TargetString = request.Serialize(),
+			}.Serialize());
+
+			var response = new HandshakeResponse
+			{
+				Mod = Game.ModData.Manifest.Id,
+				Version = Game.ModData.Manifest.Metadata.Version,
+				OrdersProtocol = ProtocolVersion.Orders,
+				Client = new Session.Client(),
+			};
+
+			Recorder.ReceiveFrame(0, 0, new Order("HandshakeResponse", null, false)
+			{
+				Type = OrderType.Handshake,
+				IsImmediate = true,
+				TargetString = response.Serialize(),
+			}.Serialize());
+		}
 
 		void IConnection.StartGame()
 		{
+			Recorder?.ReceiveFrame(0, 0, Order.FromTargetString("StartGame", "", true).Serialize());
+
 			// Inject an empty frame to fill the gap we are making by projecting forward orders
 			orders.Enqueue((0, new OrderPacket([])));
 		}
@@ -75,6 +124,7 @@ namespace OpenRA.Network
 			while (immediateOrders.TryDequeue(out var i))
 			{
 				orderManager.ReceiveImmediateOrders(LocalClientId, i);
+				Recorder?.Receive(LocalClientId, i.Serialize(0));
 
 				// An immediate order may trigger a chain of actions that disposes the OrderManager and connection.
 				// Bail out to avoid potential problems from acting on disposed objects.
@@ -84,15 +134,22 @@ namespace OpenRA.Network
 
 			// Project orders forward to the next frame
 			while (orders.TryDequeue(out var o))
+			{
 				orderManager.ReceiveOrders(LocalClientId, (o.Frame + 1, o.Orders));
+				Recorder?.Receive(LocalClientId, o.Orders.Serialize(o.Frame + 1));
+			}
 
 			while (sync.TryDequeue(out var s))
+			{
 				orderManager.ReceiveSync(s);
+				Recorder?.Receive(LocalClientId, OrderIO.SerializeSync(s));
+			}
 		}
 
 		void IDisposable.Dispose()
 		{
 			disposed = true;
+			Recorder?.Dispose();
 		}
 	}
 
