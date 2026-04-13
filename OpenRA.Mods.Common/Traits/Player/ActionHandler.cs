@@ -289,11 +289,19 @@ namespace OpenRA.Mods.Common.Traits
 					Log.Write("rl-bridge", $"Placing '{cmd.ItemType}' at requested ({cmd.TargetX},{cmd.TargetY})");
 					return MakePlaceOrder(cmd.ItemType, requestedCell, producer);
 				}
+
+				var foundNearRequested = FindPlacementCell(actorInfo, bi, requestedCell, 8);
+				if (foundNearRequested.HasValue)
+				{
+					Log.Write("rl-bridge",
+						$"Adjusted '{cmd.ItemType}' from requested ({cmd.TargetX},{cmd.TargetY}) to nearby ({foundNearRequested.Value.X},{foundNearRequested.Value.Y})");
+					return MakePlaceOrder(cmd.ItemType, foundNearRequested.Value, producer);
+				}
 			}
 
 			// Auto-find: search outward from base center
 			var baseCenter = GetBaseCenter();
-			var foundCell = FindPlacementCell(actorInfo, bi, baseCenter);
+			var foundCell = FindPlacementCell(actorInfo, bi, baseCenter, 20);
 			if (foundCell.HasValue)
 			{
 				Log.Write("rl-bridge", $"Auto-placed '{cmd.ItemType}' at ({foundCell.Value.X},{foundCell.Value.Y}) near base center ({baseCenter.X},{baseCenter.Y})");
@@ -333,10 +341,10 @@ namespace OpenRA.Mods.Common.Traits
 			return new CPos(world.Map.MapSize.Width / 2, world.Map.MapSize.Height / 2);
 		}
 
-		CPos? FindPlacementCell(ActorInfo actorInfo, BuildingInfo bi, CPos center)
+		CPos? FindPlacementCell(ActorInfo actorInfo, BuildingInfo bi, CPos center, int maxRadius)
 		{
-			// Search in expanding rings from center, up to 20 cells out
-			foreach (var cell in world.Map.FindTilesInAnnulus(center, 0, 20))
+			// Search in expanding rings from center, up to maxRadius cells out
+			foreach (var cell in world.Map.FindTilesInAnnulus(center, 0, maxRadius))
 			{
 				if (!world.CanPlaceBuilding(cell, actorInfo, bi, null))
 					continue;
