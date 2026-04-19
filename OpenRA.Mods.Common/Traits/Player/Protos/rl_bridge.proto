@@ -140,6 +140,13 @@ message RlUnitInfo {
   int32 attack_range = 17;     // Max attack range in WDist units
   int32 passenger_count = 18;  // Cargo count (0 if not transport, -1 if N/A)
   bool is_building = 19;       // false for units (helps distinguish in visible_enemies)
+
+  // True if the unit's most recent Move activity finished with
+  // CompleteDestinationBlocked — pathfinder returned no path to the
+  // commanded cell (water/cliff/blockers). Lets agents detect stuck
+  // units without position-delta heuristics. Stays false while a move
+  // is in progress or when the last move completed successfully.
+  bool path_blocked = 20;
 }
 
 message RlBuildingInfo {
