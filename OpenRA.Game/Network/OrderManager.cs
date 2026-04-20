@@ -51,8 +51,12 @@ namespace OpenRA.Network
 		public bool GameStarted => NetFrameNumber != 0;
 		public IConnection Connection { get; }
 
-		internal int GameSaveLastFrame = -1;
-		internal int GameSaveLastSyncFrame = -1;
+		// Exposed publicly so the RL bridge's LoadSnapshot RPC can set these
+		// directly after replaying a saved order stream into a fresh session.
+		// Gameplay only reads them via IsLoadingGameSave; write access is
+		// otherwise restricted to UnitOrders.
+		public int GameSaveLastFrame = -1;
+		public int GameSaveLastSyncFrame = -1;
 
 		readonly List<Order> localOrders = [];
 		readonly List<Order> localImmediateOrders = [];

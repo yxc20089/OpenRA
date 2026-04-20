@@ -373,15 +373,14 @@ namespace OpenRA.Mods.Common.Traits
 		/// Recreates the session's lobby (seed, slots, bots) from the snapshot's
 		/// metadata, then replays the stored order stream through a fresh World
 		/// so it reaches the saved tick. Trait-data patches in the snapshot are
-		/// applied via the existing World.AddGameSaveTraitData path.
+		/// applied via the existing World.AddGameSaveTraitData path when the
+		/// replay completes (see World.cs line 444 "wasLoadingGameSave").
 		///
-		/// Returns (assigned_session_id, last_frame) so the caller can verify
-		/// the load reached the expected state.
+		/// Returns (assigned_session_id, last_frame).
 		/// </summary>
 		public static (string SessionId, int LastFrame) LoadSession(byte[] snapshot, string requestedSessionId)
 		{
-			// Parse the snapshot to pull lobby metadata (seed, slots, clients) and
-			// the order stream + trait data we'll replay.
+			// Parse the snapshot metadata + order stream + trait data.
 			GameSave loaded;
 			using (var ms = new MemoryStream(snapshot, writable: false))
 				loaded = new GameSave(ms, "<LoadSnapshot>");
@@ -390,15 +389,117 @@ namespace OpenRA.Mods.Common.Traits
 				? Guid.NewGuid().ToString("N")
 				: requestedSessionId;
 
-			// TODO: drive the init path using `loaded` to recreate the lobby and
-			// fast-forward the new session through the stored order stream. This
-			// requires a variant of InitSession that takes a GameSave and wires
-			// its orders into the new OrderManager. Implemented in the next step.
-			throw new NotImplementedException(
-				$"LoadSnapshot: pending order-stream replay plumbing. " +
-				$"Parsed snapshot ok: lastFrame={loaded.LastOrdersFrame}, " +
-				$"traitData={loaded.TraitData.Count}, " +
-				$"requested session={sessionId}");
+			// Reconstruct the `bots` string (slot:bottype,...) from the saved
+			// SlotClients so InitSession's existing setup path spawns the same
+			// lobby the snapshot was produced under.
+			var bots = string.Join(",",
+				loaded.SlotClients
+					.Where(kv => !string.IsNullOrEmpty(kv.Value.Bot))
+					.Select(kv => $"{kv.Key}:{kv.Value.Bot}"));
+
+			var mapName = loaded.GlobalSettings.Map;
+			var seed = loaded.GlobalSettings.RandomSeed;
+
+			Log.Write("rl-bridge",
+				$"LoadSession {sessionId}: snapshot has map={mapName} seed={seed} " +
+				$"bots=[{bots}] lastFrame={loaded.LastOrdersFrame} traits={loaded.TraitData.Count}");
+
+			// Reuse InitSession to stand up the world, then patch the resulting
+			// session's OrderManager with the saved order stream before any
+			// RL commands come in.
+			var initThread = new Thread(() =>
+			{
+				try { InitSession(sessionId, mapName, bots, seed); }
+				catch (Exception e) { Log.Write("rl-bridge", $"LoadSession InitSession error: {e}"); }
+			})
+			{
+				IsBackground = true,
+				Name = $"RL-Load-Init-{sessionId[..8]}",
+			};
+			initThread.Start();
+
+			// Wait up to 300s for the session to be registered (matches CreateSession behavior).
+			var deadline = DateTime.UtcNow.AddSeconds(300);
+			SessionState state = null;
+			while (DateTime.UtcNow < deadline)
+			{
+				if (SessionStates.TryGetValue(sessionId, out state) && state.World != null)
+					break;
+				Thread.Sleep(50);
+			}
+
+			if (state == null)
+				throw new InvalidOperationException(
+					$"LoadSession {sessionId}: InitSession did not register a SessionState within 300s");
+
+			// Replay the saved orders into the new session's OrderManager. Orders
+			// are fed directly (bypassing the EchoConnection) to guarantee frame
+			// alignment. During this replay the World is in IsLoadingGameSave mode
+			// (NetFrameNumber < GameSaveLastFrame) and it applies the accumulated
+			// trait data once the replay finishes.
+			state.TickLock.Wait();
+			try
+			{
+				var om = state.OrderManager;
+				om.GameSaveLastFrame = loaded.LastOrdersFrame;
+				om.GameSaveLastSyncFrame = loaded.LastSyncFrame;
+
+				loaded.ParseOrders(om.LobbyInfo, (frame, clientIndex, data) =>
+				{
+					// Try order packet first; fall through to sync packet.
+					if (OrderIO.TryParseOrderPacket(data, out var op))
+					{
+						if (op.Frame == 0)
+							om.ReceiveImmediateOrders(clientIndex, op.Orders);
+						else
+							om.ReceiveOrders(clientIndex, op);
+					}
+					else if (OrderIO.TryParseSync(data, out var sync))
+					{
+						om.ReceiveSync(sync);
+					}
+					else
+					{
+						Log.Write("rl-bridge",
+							$"LoadSession {sessionId}: unrecognized packet at frame={frame} " +
+							$"client={clientIndex} len={data.Length}");
+					}
+				});
+
+				// Tick the world forward until it absorbs all replayed orders and
+				// exits loading mode. Safety cap of 2x LastOrdersFrame to avoid
+				// infinite loops if something is wrong with the replay stream.
+				var safetyCap = Math.Max(loaded.LastOrdersFrame * 2, loaded.LastOrdersFrame + 1000);
+				var ticks = 0;
+				while (om.World != null && om.World.IsLoadingGameSave && ticks < safetyCap)
+				{
+					om.LastTickTime.Value = 0;
+					Sync.RunUnsynced(false, om.World, () =>
+					{
+						om.TickImmediate();
+						return true;
+					});
+					if (om.TryTick())
+						om.World.Tick();
+					ticks++;
+				}
+
+				Log.Write("rl-bridge",
+					$"LoadSession {sessionId}: replayed {ticks} ticks, " +
+					$"world.NetFrame={om.NetFrameNumber}, " +
+					$"IsLoadingGameSave={om.World?.IsLoadingGameSave}");
+
+				if (om.World != null && om.World.IsLoadingGameSave)
+					throw new InvalidOperationException(
+						$"LoadSession {sessionId}: replay exceeded safety cap " +
+						$"({ticks} ticks) without finishing load");
+			}
+			finally
+			{
+				state.TickLock.Release();
+			}
+
+			return (sessionId, loaded.LastOrdersFrame);
 		}
 
 		/// <summary>
