@@ -47,6 +47,14 @@ namespace OpenRA.Network
 		readonly Queue<OrderPacket> immediateOrders = [];
 		bool disposed;
 
+		/// <summary>
+		/// Optional order recorder. Called on every Send/SendSync with the
+		/// assigned frame number and serialized bytes. Used by the RL bridge
+		/// to feed orders into a per-session GameSave for SaveSnapshot /
+		/// LoadSnapshot. Null in normal gameplay — no overhead.
+		/// </summary>
+		public Action<int, byte[]> OrderRecorder;
+
 		int IConnection.LocalClientId => LocalClientId;
 
 		void IConnection.StartGame()
@@ -57,17 +65,22 @@ namespace OpenRA.Network
 
 		void IConnection.Send(int frame, IEnumerable<Order> o)
 		{
-			orders.Enqueue((frame, new OrderPacket(o)));
+			var pkt = new OrderPacket(o);
+			orders.Enqueue((frame, pkt));
+			OrderRecorder?.Invoke(frame, pkt.Serialize(frame));
 		}
 
 		void IConnection.SendImmediate(IEnumerable<Order> o)
 		{
-			immediateOrders.Enqueue(new OrderPacket(o));
+			var pkt = new OrderPacket(o);
+			immediateOrders.Enqueue(pkt);
+			OrderRecorder?.Invoke(0, pkt.Serialize(0));
 		}
 
 		void IConnection.SendSync(int frame, int syncHash, ulong defeatState)
 		{
 			sync.Enqueue((frame, syncHash, defeatState));
+			OrderRecorder?.Invoke(frame, OrderIO.SerializeSync((frame, syncHash, defeatState)));
 		}
 
 		void IConnection.Receive(OrderManager orderManager)

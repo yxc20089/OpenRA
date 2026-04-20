@@ -56,6 +56,14 @@ namespace OpenRA.Mods.Common.Traits
 		{
 			public readonly OrderManager OrderManager;
 			public readonly World World;
+			/// <summary>
+			/// Per-session GameSave that captures every order sent through
+			/// this session's EchoConnection. Populated during InitSession and
+			/// used by SaveSnapshot to serialize a point-in-time snapshot.
+			/// </summary>
+			public GameSave GameSave;
+			/// <summary>The MapPreview used to start this session (needed to restore on load).</summary>
+			public MapPreview MapPreview;
 
 			/// <summary>Prevents two concurrent FastAdvance calls from ticking the same World.</summary>
 			public readonly SemaphoreSlim TickLock = new(1, 1);
@@ -467,6 +475,14 @@ namespace OpenRA.Mods.Common.Traits
 			var connection = new EchoConnection();
 			var orderManager = new OrderManager(connection);
 
+			// Per-session GameSave: captures every order that flows through
+			// this session's EchoConnection so SaveSnapshot can serialize a
+			// point-in-time snapshot. Wired as an OrderRecorder callback
+			// before the game starts so it sees the initial order stream.
+			var gameSave = new GameSave();
+			connection.OrderRecorder = (frame, data) =>
+				gameSave.DispatchOrders(connection_LocalClientId(), frame, data);
+
 			// 5. Build LobbyInfo with map slots and bot assignments
 			SetupLobbyInfo(orderManager, mapPreview, map, bots, seed);
 
@@ -481,6 +497,10 @@ namespace OpenRA.Mods.Common.Traits
 				orderManager.World = new World(map, modData, orderManager, WorldType.Regular);
 				ExternalBotBridge.NextSessionId = null;
 				orderManager.World.LoadComplete(null);
+				// GameSave needs the lobby metadata (slot→client mapping) before
+				// DispatchOrders can classify orders. StartGame here primes the
+				// internal clientsBySlotIndex array from the lobby we built.
+				gameSave.StartGame(orderManager.LobbyInfo, mapPreview);
 				orderManager.StartGame();
 			}
 
@@ -490,7 +510,11 @@ namespace OpenRA.Mods.Common.Traits
 			// the bridge becomes visible to gRPC. This prevents a race where
 			// FastAdvance finds the bridge (via WaitForBridge) but SessionStates
 			// hasn't been populated yet, causing NOT_FOUND.
-			SessionStates[sessionId] = new SessionState(orderManager, world);
+			SessionStates[sessionId] = new SessionState(orderManager, world)
+			{
+				GameSave = gameSave,
+				MapPreview = mapPreview,
+			};
 
 			// 8. Find the ExternalBotBridge
 			ExternalBotBridge bridge = null;

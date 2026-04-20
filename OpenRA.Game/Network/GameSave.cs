@@ -214,6 +214,16 @@ namespace OpenRA.Network
 
 		public void DispatchOrders(Connection conn, int frame, byte[] data)
 		{
+			DispatchOrders(conn.PlayerIndex, frame, data);
+		}
+
+		/// <summary>
+		/// Record orders by player-index directly (without requiring a Server
+		/// Connection instance). Used by the RL bridge's EchoConnection-based
+		/// sessions, which don't route through the networked Server path.
+		/// </summary>
+		public void DispatchOrders(int playerIndex, int frame, byte[] data)
+		{
 			// Sync packet - we only care about the last value
 			if (data.Length > 0 && data[0] == (byte)OrderType.SyncHash && frame > LastSyncFrame)
 			{
@@ -234,7 +244,7 @@ namespace OpenRA.Network
 			if (data.Length > 0 && data[0] == 0xFE)
 				return;
 
-			var clientSlot = clientsBySlotIndex.IndexOf(conn.PlayerIndex);
+			var clientSlot = clientsBySlotIndex.IndexOf(playerIndex);
 
 			// Handle orders that were sent by spectators
 			if (clientSlot == -1)
