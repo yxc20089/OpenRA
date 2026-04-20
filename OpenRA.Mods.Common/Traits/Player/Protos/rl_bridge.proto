@@ -22,6 +22,17 @@ service RLBridge {
   // Session management (multi-session mode)
   rpc CreateSession(CreateSessionRequest) returns (CreateSessionResponse);
   rpc DestroySession(DestroySessionRequest) returns (DestroySessionResponse);
+
+  // Snapshot a running session into an .orasav-format byte blob. The
+  // returned bytes can be passed to LoadSnapshot (same process, different
+  // session) to recreate the exact state. Used by expert-anchored GRPO
+  // to fork K samples from the expert's state at a chosen tick.
+  rpc SaveSnapshot(SaveSnapshotRequest) returns (SaveSnapshotResponse);
+
+  // Create a new session by loading an .orasav byte blob produced by a
+  // prior SaveSnapshot. The new session replays the recorded orders and
+  // applies stored trait-data patches to reach the saved tick.
+  rpc LoadSnapshot(LoadSnapshotRequest) returns (LoadSnapshotResponse);
 }
 
 // ─── Observations (Game → Agent) ────────────────────────────────────────────
@@ -276,3 +287,32 @@ message DestroySessionRequest {
 }
 
 message DestroySessionResponse {}
+
+// ─── Snapshot / Restore (Multi-Session Mode) ────────────────────────────────
+
+message SaveSnapshotRequest {
+  string session_id = 1;
+}
+
+message SaveSnapshotResponse {
+  // .orasav-format bytes capturing the session's full order stream +
+  // lobby metadata + per-trait state.
+  bytes snapshot = 1;
+  // Last frame number the snapshot covers (for debugging / logging).
+  int32 last_frame = 2;
+}
+
+message LoadSnapshotRequest {
+  // .orasav-format bytes from a prior SaveSnapshot call.
+  bytes snapshot = 1;
+  // Optional requested session_id for the new loaded session. If empty,
+  // a fresh UUID is assigned.
+  string session_id = 2;
+}
+
+message LoadSnapshotResponse {
+  // Actual session_id assigned to the loaded session.
+  string session_id = 1;
+  // Frame the loaded session reached after applying the snapshot.
+  int32 last_frame = 2;
+}

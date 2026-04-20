@@ -319,6 +319,89 @@ namespace OpenRA.Mods.Common.Traits
 		}
 
 		/// <summary>
+		/// Serialize a session's current state into an .orasav-format byte blob.
+		///
+		/// Collects per-trait data from every IGameSaveTraitData implementor
+		/// (mirrors what World.RequestGameSave does order-wise, but directly
+		/// since RL mode has no Server to route GameSaveTraitData orders to
+		/// GameSave.AddTraitData), then serializes the already-accumulated
+		/// order stream + lobby metadata + trait data via GameSave.Save.
+		/// </summary>
+		public static (byte[] Bytes, int LastFrame) SaveSession(string sessionId)
+		{
+			if (!SessionStates.TryGetValue(sessionId, out var state))
+				throw new InvalidOperationException($"SaveSession: session {sessionId} not found");
+
+			var gs = state.GameSave
+				?? throw new InvalidOperationException($"SaveSession: session {sessionId} has no GameSave");
+			var world = state.World
+				?? throw new InvalidOperationException($"SaveSession: session {sessionId} has no World");
+
+			// Take the session's tick lock so we're not racing World.Tick while
+			// iterating traits and serializing.
+			state.TickLock.Wait();
+			try
+			{
+				// Mirror World.RequestGameSave's trait-data collection, but write
+				// directly into GameSave.TraitData instead of going through the
+				// order stream (which would only be processed by a Server).
+				var i = 0;
+				foreach (var tp in world.ActorsWithTrait<IGameSaveTraitData>())
+				{
+					var data = tp.Trait.IssueTraitData(tp.Actor);
+					if (data != null && data.Count > 0)
+						gs.AddTraitData(i, new MiniYaml("", data));
+					i++;
+				}
+
+				using var ms = new MemoryStream();
+				gs.Save(ms);
+				Log.Write("rl-bridge",
+					$"SaveSession: {sessionId} serialized {ms.Length} bytes " +
+					$"(lastFrame={gs.LastOrdersFrame}, traits={gs.TraitData.Count})");
+				return (ms.ToArray(), gs.LastOrdersFrame);
+			}
+			finally
+			{
+				state.TickLock.Release();
+			}
+		}
+
+		/// <summary>
+		/// Create a new session by loading an .orasav byte blob.
+		///
+		/// Recreates the session's lobby (seed, slots, bots) from the snapshot's
+		/// metadata, then replays the stored order stream through a fresh World
+		/// so it reaches the saved tick. Trait-data patches in the snapshot are
+		/// applied via the existing World.AddGameSaveTraitData path.
+		///
+		/// Returns (assigned_session_id, last_frame) so the caller can verify
+		/// the load reached the expected state.
+		/// </summary>
+		public static (string SessionId, int LastFrame) LoadSession(byte[] snapshot, string requestedSessionId)
+		{
+			// Parse the snapshot to pull lobby metadata (seed, slots, clients) and
+			// the order stream + trait data we'll replay.
+			GameSave loaded;
+			using (var ms = new MemoryStream(snapshot, writable: false))
+				loaded = new GameSave(ms, "<LoadSnapshot>");
+
+			var sessionId = string.IsNullOrEmpty(requestedSessionId)
+				? Guid.NewGuid().ToString("N")
+				: requestedSessionId;
+
+			// TODO: drive the init path using `loaded` to recreate the lobby and
+			// fast-forward the new session through the stored order stream. This
+			// requires a variant of InitSession that takes a GameSave and wires
+			// its orders into the new OrderManager. Implemented in the next step.
+			throw new NotImplementedException(
+				$"LoadSnapshot: pending order-stream replay plumbing. " +
+				$"Parsed snapshot ok: lastFrame={loaded.LastOrdersFrame}, " +
+				$"traitData={loaded.TraitData.Count}, " +
+				$"requested session={sessionId}");
+		}
+
+		/// <summary>
 		/// Tick a session's game forward until fast-advance completes or game ends.
 		/// Called by worker threads, not by gRPC threads.
 		/// </summary>
