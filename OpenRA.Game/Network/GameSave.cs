@@ -86,7 +86,23 @@ namespace OpenRA.Network
 		// Loaded from file and updated during gameplay
 		public int LastOrdersFrame { get; private set; }
 		public int LastSyncFrame { get; private set; }
-		byte[] lastSyncPacket = [];
+
+		/// <summary>
+		/// Set LastOrdersFrame without going through the order-stream path.
+		/// Used by the RL bridge's SaveSnapshot, which skips order recording
+		/// (it uses advance-and-patch instead) but still needs the frame
+		/// written into the saved metadata so LoadSnapshot knows how far to
+		/// fast-forward the restored session.
+		/// </summary>
+		public void SetSavedFrame(int frame)
+		{
+			LastOrdersFrame = frame;
+		}
+		// Pre-sized so Save() can always emit Order.SyncHashOrderLength bytes
+		// even when the session hasn't dispatched any sync packets yet (first
+		// few ticks of an RL session). Filled in via DispatchOrders when a
+		// real sync arrives; zeroed slot is otherwise harmless.
+		byte[] lastSyncPacket = new byte[Order.SyncHashOrderLength];
 
 		// Loaded from file or set on game start
 		public Session.Global GlobalSettings { get; private set; }

@@ -60,7 +60,12 @@ namespace OpenRA.Network
 			data.Position = 0;
 			data.CopyTo(ms);
 
-			return ms.GetBuffer();
+			// ToArray — not GetBuffer — to guarantee the returned array length
+			// matches the actual written byte count. GetBuffer exposes the
+			// internal (possibly larger) capacity array, which causes
+			// GameSave.DispatchOrders to record trailing garbage and corrupt
+			// the order stream when the save is replayed.
+			return ms.ToArray();
 		}
 
 		public static OrderPacket Combine(IEnumerable<OrderPacket> packets)
