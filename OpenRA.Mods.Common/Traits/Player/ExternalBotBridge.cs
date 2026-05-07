@@ -467,8 +467,17 @@ namespace OpenRA.Mods.Common.Traits
 						var shroud = player?.Shroud;
 						if (shroud != null)
 						{
-							var totalCells = world.Map.AllCells.Count();
-							var exploredCells = world.Map.AllCells.Count(c => shroud.IsExplored(c));
+							// Denominator is the playable rectangle (Map.Bounds), not all map cells.
+							// Map.AllCells includes the 2-cell shroud border outside Bounds; counting
+							// those makes the % exceed 100 (observed up to 108% on rush-hour where
+							// playable=124x36=4464 but raw map=128x40=5120). 100% must mean
+							// 'entire playable region revealed'.
+							var bounds = world.Map.Bounds;
+							var totalCells = bounds.Width * bounds.Height;
+							var exploredCells = 0;
+							for (var y = bounds.Top; y < bounds.Bottom; y++)
+								for (var x = bounds.Left; x < bounds.Right; x++)
+									if (shroud.IsExplored(new CPos(x, y))) exploredCells++;
 							obs.ExploredPercent = totalCells > 0 ? (float)exploredCells / totalCells * 100f : 0f;
 						}
 
@@ -599,7 +608,9 @@ namespace OpenRA.Mods.Common.Traits
 		void SnapshotActors()
 		{
 			cachedMobileActors.Clear();
-			if (cachedTotalCells == 0) cachedTotalCells = world.Map.AllCells.Count();
+			// Use playable rectangle, not Map.AllCells (which includes the 2-cell
+			// shroud border around the map and would inflate the explored% denominator).
+			if (cachedTotalCells == 0) cachedTotalCells = world.Map.Bounds.Width * world.Map.Bounds.Height;
 			cachedMobileActors.AddRange(world.ActorsHavingTrait<Mobile>());
 			cachedBuildingActors.Clear();
 			cachedBuildingActors.AddRange(world.ActorsHavingTrait<Building>());
@@ -669,9 +680,13 @@ namespace OpenRA.Mods.Common.Traits
 			var shroudForExplored = player?.Shroud;
 			if (shroudForExplored != null && cachedTotalCells > 0)
 			{
+				// Iterate playable cells only (Map.Bounds), matching the
+				// at-advance-end ExploredPercent calculation.
+				var bounds = world.Map.Bounds;
 				var exploredCells = 0;
-				foreach (var c in world.Map.AllCells)
-					if (shroudForExplored.IsExplored(c)) exploredCells++;
+				for (var y = bounds.Top; y < bounds.Bottom; y++)
+					for (var x = bounds.Left; x < bounds.Right; x++)
+						if (shroudForExplored.IsExplored(new CPos(x, y))) exploredCells++;
 				exploredPct = (float)exploredCells / cachedTotalCells * 100f;
 			}
 
