@@ -86,7 +86,23 @@ namespace OpenRA.Network
 		// Loaded from file and updated during gameplay
 		public int LastOrdersFrame { get; private set; }
 		public int LastSyncFrame { get; private set; }
-		byte[] lastSyncPacket = [];
+
+		/// <summary>
+		/// Set LastOrdersFrame without going through the order-stream path.
+		/// Used by the RL bridge's SaveSnapshot, which skips order recording
+		/// (it uses advance-and-patch instead) but still needs the frame
+		/// written into the saved metadata so LoadSnapshot knows how far to
+		/// fast-forward the restored session.
+		/// </summary>
+		public void SetSavedFrame(int frame)
+		{
+			LastOrdersFrame = frame;
+		}
+		// Pre-sized so Save() can always emit Order.SyncHashOrderLength bytes
+		// even when the session hasn't dispatched any sync packets yet (first
+		// few ticks of an RL session). Filled in via DispatchOrders when a
+		// real sync arrives; zeroed slot is otherwise harmless.
+		byte[] lastSyncPacket = new byte[Order.SyncHashOrderLength];
 
 		// Loaded from file or set on game start
 		public Session.Global GlobalSettings { get; private set; }
@@ -106,27 +122,38 @@ namespace OpenRA.Network
 		}
 
 		public GameSave(string filepath)
+			: this(File.OpenRead(filepath), $"{filepath}", ownsStream: true) { }
+
+		/// <summary>
+		/// Load a save from any seekable Stream (file, MemoryStream, etc).
+		/// Used by the RL bridge's in-memory SaveSnapshot/LoadSnapshot RPC pair
+		/// so snapshots can flow across the wire without touching disk.
+		/// </summary>
+		public GameSave(Stream rs, string sourceLabel = "<stream>", bool ownsStream = false)
 		{
-			using (var rs = File.OpenRead(filepath))
+			try
 			{
+				LastOrdersFrame = -1;
+				Slots = [];
+
 				rs.Seek(-12, SeekOrigin.End);
 				var metadataOffset = rs.ReadInt32();
 				var traitDataOffset = rs.ReadInt32();
 				if (rs.ReadInt32() != EOFMarker)
-					throw new InvalidDataException("Invalid orasav file");
+					throw new InvalidDataException("Invalid orasav stream");
 
 				rs.Seek(metadataOffset, SeekOrigin.Begin);
 				if (rs.ReadInt32() != MetadataMarker)
-					throw new InvalidDataException("Invalid orasav file");
+					throw new InvalidDataException("Invalid orasav stream");
 
 				LastOrdersFrame = rs.ReadInt32();
 				LastSyncFrame = rs.ReadInt32();
 				lastSyncPacket = rs.ReadBytes(Order.SyncHashOrderLength);
 
-				var globalSettings = MiniYaml.FromString(rs.ReadLengthPrefixedString(Encoding.UTF8, Connection.MaxOrderLength), $"{filepath}:globalSettings");
+				var globalSettings = MiniYaml.FromString(rs.ReadLengthPrefixedString(Encoding.UTF8, Connection.MaxOrderLength), $"{sourceLabel}:globalSettings");
 				GlobalSettings = Session.Global.Deserialize(globalSettings.First().Value);
 
-				var slots = MiniYaml.FromString(rs.ReadLengthPrefixedString(Encoding.UTF8, Connection.MaxOrderLength), $"{filepath}:slots");
+				var slots = MiniYaml.FromString(rs.ReadLengthPrefixedString(Encoding.UTF8, Connection.MaxOrderLength), $"{sourceLabel}:slots");
 				Slots = [];
 				foreach (var s in slots)
 				{
@@ -134,7 +161,7 @@ namespace OpenRA.Network
 					Slots.Add(slot.PlayerReference, slot);
 				}
 
-				var slotClients = MiniYaml.FromString(rs.ReadLengthPrefixedString(Encoding.UTF8, Connection.MaxOrderLength), $"{filepath}:slotClients");
+				var slotClients = MiniYaml.FromString(rs.ReadLengthPrefixedString(Encoding.UTF8, Connection.MaxOrderLength), $"{sourceLabel}:slotClients");
 				SlotClients = [];
 				foreach (var s in slotClients)
 				{
@@ -144,17 +171,22 @@ namespace OpenRA.Network
 
 				var mapGenerationArgs = rs.ReadLengthPrefixedString(Encoding.UTF8, Connection.MaxOrderLength);
 				if (!string.IsNullOrEmpty(mapGenerationArgs))
-					MapGenerationArgs = FieldLoader.Load<MapGenerationArgs>(new MiniYaml("", MiniYaml.FromString(mapGenerationArgs, $"{filepath}:mapGenerationArgs")));
+					MapGenerationArgs = FieldLoader.Load<MapGenerationArgs>(new MiniYaml("", MiniYaml.FromString(mapGenerationArgs, $"{sourceLabel}:mapGenerationArgs")));
 
 				if (rs.Position != traitDataOffset || rs.ReadInt32() != TraitDataMarker)
-					throw new InvalidDataException("Invalid orasav file");
+					throw new InvalidDataException("Invalid orasav stream");
 
-				var traitData = MiniYaml.FromString(rs.ReadLengthPrefixedString(Encoding.UTF8, Connection.MaxOrderLength), $"{filepath}:traitData");
+				var traitData = MiniYaml.FromString(rs.ReadLengthPrefixedString(Encoding.UTF8, Connection.MaxOrderLength), $"{sourceLabel}:traitData");
 				foreach (var td in traitData)
 					TraitData.Add(Exts.ParseInt32Invariant(td.Key), td.Value);
 
 				rs.Seek(0, SeekOrigin.Begin);
 				ordersStream.Write(rs.ReadBytes(metadataOffset), 0, metadataOffset);
+			}
+			finally
+			{
+				if (ownsStream)
+					rs.Dispose();
 			}
 		}
 
@@ -198,6 +230,16 @@ namespace OpenRA.Network
 
 		public void DispatchOrders(Connection conn, int frame, byte[] data)
 		{
+			DispatchOrders(conn.PlayerIndex, frame, data);
+		}
+
+		/// <summary>
+		/// Record orders by player-index directly (without requiring a Server
+		/// Connection instance). Used by the RL bridge's EchoConnection-based
+		/// sessions, which don't route through the networked Server path.
+		/// </summary>
+		public void DispatchOrders(int playerIndex, int frame, byte[] data)
+		{
 			// Sync packet - we only care about the last value
 			if (data.Length > 0 && data[0] == (byte)OrderType.SyncHash && frame > LastSyncFrame)
 			{
@@ -218,7 +260,7 @@ namespace OpenRA.Network
 			if (data.Length > 0 && data[0] == 0xFE)
 				return;
 
-			var clientSlot = clientsBySlotIndex.IndexOf(conn.PlayerIndex);
+			var clientSlot = clientsBySlotIndex.IndexOf(playerIndex);
 
 			// Handle orders that were sent by spectators
 			if (clientSlot == -1)
@@ -278,56 +320,64 @@ namespace OpenRA.Network
 
 		public void Save(string path)
 		{
-			// File format:
-			// - List of orders in network frame format
-			// - Metadata start marker
-			//   - Last frame number containing orders (int32)
-			//   - Last frame number containing sync hash (int32)
-			//   - Last sync packet (5 x byte)
-			//   - Lobby global settings (yaml)
-			//   - Lobby slots (yaml)
-			//   - Lobby slot-client data (yaml)
-			// - Trait data start marker
-			//   - Custom trait yaml
-			// - File offset of metadata start marker
-			// - File offset of custom trait data
-			// - Metadata end marker
-			using (var file = File.Create(path))
-			{
-				ordersStream.Seek(0, SeekOrigin.Begin);
-				ordersStream.CopyTo(file);
-				file.Write(MetadataMarker);
-				file.Write(LastOrdersFrame);
-				file.Write(LastSyncFrame);
-				file.Write(lastSyncPacket, 0, Order.SyncHashOrderLength);
+			using var file = File.Create(path);
+			Save(file);
+		}
 
-				var globalSettingsNodes = new List<MiniYamlNode>() { GlobalSettings.Serialize() };
-				file.WriteLengthPrefixedString(Encoding.UTF8, globalSettingsNodes.WriteToString());
+		/// <summary>
+		/// Serialize to any writable Stream (file or MemoryStream). Used by the
+		/// RL bridge's SaveSnapshot RPC to return the save bytes in-memory.
+		///
+		/// File format:
+		/// - List of orders in network frame format
+		/// - Metadata start marker
+		///   - Last frame number containing orders (int32)
+		///   - Last frame number containing sync hash (int32)
+		///   - Last sync packet (5 x byte)
+		///   - Lobby global settings (yaml)
+		///   - Lobby slots (yaml)
+		///   - Lobby slot-client data (yaml)
+		/// - Trait data start marker
+		///   - Custom trait yaml
+		/// - File offset of metadata start marker
+		/// - File offset of custom trait data
+		/// - Metadata end marker
+		/// </summary>
+		public void Save(Stream file)
+		{
+			ordersStream.Seek(0, SeekOrigin.Begin);
+			ordersStream.CopyTo(file);
+			file.Write(MetadataMarker);
+			file.Write(LastOrdersFrame);
+			file.Write(LastSyncFrame);
+			file.Write(lastSyncPacket, 0, Order.SyncHashOrderLength);
 
-				var slotNodes = Slots
-					.Select(s => s.Value.Serialize())
-					.ToList();
-				file.WriteLengthPrefixedString(Encoding.UTF8, slotNodes.WriteToString());
+			var globalSettingsNodes = new List<MiniYamlNode>() { GlobalSettings.Serialize() };
+			file.WriteLengthPrefixedString(Encoding.UTF8, globalSettingsNodes.WriteToString());
 
-				var slotClientNodes = SlotClients
-					.Select(s => s.Value.Serialize(s.Key))
-					.ToList();
-				file.WriteLengthPrefixedString(Encoding.UTF8, slotClientNodes.WriteToString());
+			var slotNodes = Slots
+				.Select(s => s.Value.Serialize())
+				.ToList();
+			file.WriteLengthPrefixedString(Encoding.UTF8, slotNodes.WriteToString());
 
-				file.WriteLengthPrefixedString(Encoding.UTF8, MapGenerationArgs?.Serialize().WriteToString() ?? string.Empty);
+			var slotClientNodes = SlotClients
+				.Select(s => s.Value.Serialize(s.Key))
+				.ToList();
+			file.WriteLengthPrefixedString(Encoding.UTF8, slotClientNodes.WriteToString());
 
-				var traitDataOffset = file.Length;
-				file.Write(TraitDataMarker);
+			file.WriteLengthPrefixedString(Encoding.UTF8, MapGenerationArgs?.Serialize().WriteToString() ?? string.Empty);
 
-				var traitDataNodes = TraitData
-					.Select(kv => new MiniYamlNode(kv.Key.ToStringInvariant(), kv.Value))
-					.ToList();
-				file.WriteLengthPrefixedString(Encoding.UTF8, traitDataNodes.WriteToString());
+			var traitDataOffset = file.Position;
+			file.Write(TraitDataMarker);
 
-				file.Write((int)ordersStream.Length);
-				file.Write((int)traitDataOffset);
-				file.Write(EOFMarker);
-			}
+			var traitDataNodes = TraitData
+				.Select(kv => new MiniYamlNode(kv.Key.ToStringInvariant(), kv.Value))
+				.ToList();
+			file.WriteLengthPrefixedString(Encoding.UTF8, traitDataNodes.WriteToString());
+
+			file.Write((int)ordersStream.Length);
+			file.Write((int)traitDataOffset);
+			file.Write(EOFMarker);
 		}
 	}
 }

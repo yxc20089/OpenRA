@@ -56,6 +56,13 @@ namespace OpenRA.Mods.Common.Traits
 		{
 			public readonly OrderManager OrderManager;
 			public readonly World World;
+			/// <summary>
+			/// Per-session GameSave that captures every order sent through
+			/// this session's EchoConnection. Populated during InitSession and
+			/// used by SaveSnapshot to serialize a point-in-time snapshot.
+			/// </summary>
+			/// <summary>The MapPreview used to start this session (needed to restore on load).</summary>
+			public MapPreview MapPreview;
 
 			/// <summary>Prevents two concurrent FastAdvance calls from ticking the same World.</summary>
 			public readonly SemaphoreSlim TickLock = new(1, 1);
@@ -311,6 +318,221 @@ namespace OpenRA.Mods.Common.Traits
 		}
 
 		/// <summary>
+		/// Serialize a session's current state into an .orasav-format byte blob.
+		///
+		/// Collects per-trait data from every IGameSaveTraitData implementor
+		/// (mirrors what World.RequestGameSave does order-wise, but directly
+		/// since RL mode has no Server to route GameSaveTraitData orders to
+		/// GameSave.AddTraitData), then serializes the already-accumulated
+		/// order stream + lobby metadata + trait data via GameSave.Save.
+		/// </summary>
+		public static (byte[] Bytes, int LastFrame) SaveSession(string sessionId)
+		{
+			if (!SessionStates.TryGetValue(sessionId, out var state))
+				throw new InvalidOperationException($"SaveSession: session {sessionId} not found");
+
+			var world = state.World
+				?? throw new InvalidOperationException($"SaveSession: session {sessionId} has no World");
+			var om = state.OrderManager
+				?? throw new InvalidOperationException($"SaveSession: session {sessionId} has no OrderManager");
+
+			// Take the session's tick lock so we're not racing World.Tick while
+			// iterating traits and serializing.
+			state.TickLock.Wait();
+			try
+			{
+				// Build a fresh GameSave using the existing engine machinery:
+				//   1. StartGame populates lobby metadata (slot->client mapping).
+				//   2. We collect IGameSaveTraitData directly — the same traits
+				//      World.RequestGameSave would iterate — and hand their YAML
+				//      to GameSave.AddTraitData (what Server.InterpretServerOrder
+				//      would do for "GameSaveTraitData" orders).
+				//   3. LastOrdersFrame is set to the current NetFrameNumber so
+				//      LoadSession knows how far to fast-forward the new session.
+				//
+				// We skip the order-stream side of GameSave entirely. On load we
+				// rely on within-process lockstep determinism: recreate the same
+				// lobby, advance the new World to the same tick, then overwrite
+				// trait state with the stored patches. This is exactly the engine's
+				// "replay + trait-patch" model, minus the per-tick order recording
+				// we don't need in RL mode (no user commands between SaveSnapshots).
+				var gs = new GameSave();
+				gs.StartGame(om.LobbyInfo, state.MapPreview);
+
+				var i = 0;
+				foreach (var tp in world.ActorsWithTrait<IGameSaveTraitData>())
+				{
+					// Some traits (e.g. GameSaveViewportManager) reference a
+					// WorldRenderer that doesn't exist in headless mode. Skip
+					// those — the saved state without their data is still usable.
+					try
+					{
+						var data = tp.Trait.IssueTraitData(tp.Actor);
+						if (data != null && data.Count > 0)
+							gs.AddTraitData(i, new MiniYaml("", data));
+					}
+					catch (Exception tex)
+					{
+						Log.Write("rl-bridge",
+							$"SaveSession: skipping trait {tp.Trait.GetType().Name} " +
+							$"(actor={tp.Actor.ActorID}, error={tex.GetType().Name}: {tex.Message})");
+					}
+					i++;
+				}
+
+				gs.SetSavedFrame(om.NetFrameNumber);
+
+				using var ms = new MemoryStream();
+				gs.Save(ms);
+				Log.Write("rl-bridge",
+					$"SaveSession: {sessionId} serialized {ms.Length} bytes " +
+					$"(savedFrame={om.NetFrameNumber}, traits={gs.TraitData.Count})");
+				return (ms.ToArray(), om.NetFrameNumber);
+			}
+			finally
+			{
+				state.TickLock.Release();
+			}
+		}
+
+		/// <summary>
+		/// Create a new session by loading an .orasav byte blob.
+		///
+		/// Uses within-process lockstep determinism: recreate a lobby with the
+		/// same (map, seed, bots) as the saved session, advance the new World
+		/// to the saved NetFrameNumber via TickImmediate/TryTick, then overwrite
+		/// trait state with the stored patches via the same
+		/// IGameSaveTraitData.ResolveTraitData call the engine's load path
+		/// uses (World.cs line 448). No order-stream replay needed — two
+		/// sessions with identical (map, seed) and no user commands tick
+		/// deterministically within one process.
+		///
+		/// Returns (assigned_session_id, last_frame).
+		/// </summary>
+		public static (string SessionId, int LastFrame) LoadSession(byte[] snapshot, string requestedSessionId)
+		{
+			// Parse the snapshot metadata + order stream + trait data.
+			GameSave loaded;
+			using (var ms = new MemoryStream(snapshot, writable: false))
+				loaded = new GameSave(ms, "<LoadSnapshot>");
+
+			var sessionId = string.IsNullOrEmpty(requestedSessionId)
+				? Guid.NewGuid().ToString("N")
+				: requestedSessionId;
+
+			// Reconstruct the `bots` string (slot:bottype,...) from the saved
+			// SlotClients so InitSession's existing setup path spawns the same
+			// lobby the snapshot was produced under.
+			var bots = string.Join(",",
+				loaded.SlotClients
+					.Where(kv => !string.IsNullOrEmpty(kv.Value.Bot))
+					.Select(kv => $"{kv.Key}:{kv.Value.Bot}"));
+
+			var mapName = loaded.GlobalSettings.Map;
+			var seed = loaded.GlobalSettings.RandomSeed;
+
+			Log.Write("rl-bridge",
+				$"LoadSession {sessionId}: snapshot has map={mapName} seed={seed} " +
+				$"bots=[{bots}] lastFrame={loaded.LastOrdersFrame} traits={loaded.TraitData.Count}");
+
+			// Reuse InitSession to stand up the world, then patch the resulting
+			// session's OrderManager with the saved order stream before any
+			// RL commands come in.
+			var initThread = new Thread(() =>
+			{
+				try { InitSession(sessionId, mapName, bots, seed); }
+				catch (Exception e) { Log.Write("rl-bridge", $"LoadSession InitSession error: {e}"); }
+			})
+			{
+				IsBackground = true,
+				Name = $"RL-Load-Init-{sessionId[..8]}",
+			};
+			initThread.Start();
+
+			// Wait up to 300s for the session to be registered (matches CreateSession behavior).
+			var deadline = DateTime.UtcNow.AddSeconds(300);
+			SessionState state = null;
+			while (DateTime.UtcNow < deadline)
+			{
+				if (SessionStates.TryGetValue(sessionId, out state) && state.World != null)
+					break;
+				Thread.Sleep(50);
+			}
+
+			if (state == null)
+				throw new InvalidOperationException(
+					$"LoadSession {sessionId}: InitSession did not register a SessionState within 300s");
+
+			state.TickLock.Wait();
+			try
+			{
+				var om = state.OrderManager;
+				var targetFrame = loaded.LastOrdersFrame;
+
+				// Fast-forward the new session's World to the saved tick. No user
+				// orders are issued here — we rely on within-process lockstep
+				// determinism: same (map, seed) + same tick count → same state
+				// (modulo any per-session non-determinism, which the trait-data
+				// patches below correct).
+				var ticks = 0;
+				var safetyCap = Math.Max(targetFrame * 4, targetFrame + 1000);
+				while (om.World != null && om.NetFrameNumber < targetFrame && ticks < safetyCap)
+				{
+					om.LastTickTime.Value = 0;
+					Sync.RunUnsynced(false, om.World, () =>
+					{
+						om.TickImmediate();
+						return true;
+					});
+					if (om.TryTick())
+						om.World.Tick();
+					ticks++;
+				}
+
+				Log.Write("rl-bridge",
+					$"LoadSession {sessionId}: advanced {ticks} ticks to " +
+					$"NetFrame={om.NetFrameNumber} (target={targetFrame})");
+
+				// Apply trait-data patches via the engine's canonical
+				// ResolveTraitData path — same mechanism the load flow would use.
+				// Index order matches SaveSession's collection loop.
+				var appliedTraits = 0;
+				var skippedTraits = 0;
+				var i = 0;
+				foreach (var tp in om.World.ActorsWithTrait<IGameSaveTraitData>())
+				{
+					if (loaded.TraitData.TryGetValue(i, out var yaml))
+					{
+						try
+						{
+							tp.Trait.ResolveTraitData(tp.Actor, yaml);
+							appliedTraits++;
+						}
+						catch (Exception tex)
+						{
+							skippedTraits++;
+							Log.Write("rl-bridge",
+								$"LoadSession {sessionId}: ResolveTraitData failed on " +
+								$"{tp.Trait.GetType().Name} actor={tp.Actor.ActorID}: " +
+								$"{tex.GetType().Name}: {tex.Message}");
+						}
+					}
+					i++;
+				}
+
+				Log.Write("rl-bridge",
+					$"LoadSession {sessionId}: applied {appliedTraits} trait patches " +
+					$"(skipped {skippedTraits}) of {loaded.TraitData.Count} in snapshot");
+			}
+			finally
+			{
+				state.TickLock.Release();
+			}
+
+			return (sessionId, loaded.LastOrdersFrame);
+		}
+
+		/// <summary>
 		/// Tick a session's game forward until fast-advance completes or game ends.
 		/// Called by worker threads, not by gRPC threads.
 		/// </summary>
@@ -493,7 +715,10 @@ namespace OpenRA.Mods.Common.Traits
 			// the bridge becomes visible to gRPC. This prevents a race where
 			// FastAdvance finds the bridge (via WaitForBridge) but SessionStates
 			// hasn't been populated yet, causing NOT_FOUND.
-			SessionStates[sessionId] = new SessionState(orderManager, world);
+			SessionStates[sessionId] = new SessionState(orderManager, world)
+			{
+				MapPreview = mapPreview,
+			};
 
 			// 8. Find the ExternalBotBridge
 			ExternalBotBridge bridge = null;

@@ -116,6 +116,11 @@ namespace OpenRA.Mods.Common.Traits
 		volatile bool agentConnected;
 		bool connectionLostHandled;
 
+		// Kill events: populated by INotifyKilled hook on UpdatesPlayerStatistics,
+		// drained at each FastAdvance response. Authoritative — includes attacker
+		// identity (e.Attacker) and victim position at death time.
+		readonly ConcurrentQueue<RLProto.RlKillEvent> killEventQueue = new();
+
 		// Fast-forward: when > 0, game runs at max speed until this tick is reached.
 		// Volatile: written by gRPC thread in RequestFastAdvance, read by game thread in Tick.
 		volatile int pendingFastAdvanceTarget;
@@ -336,6 +341,7 @@ namespace OpenRA.Mods.Common.Traits
 						var obs = observationSerializer.Serialize(world.WorldTick);
 						obs.Done = true;
 						obs.Result = player.WinState == WinState.Won ? "win" : "lose";
+						DrainKillEventsInto(obs);
 						gameOverTcs.TrySetResult(obs);
 					}
 					catch (Exception e)
@@ -461,11 +467,21 @@ namespace OpenRA.Mods.Common.Traits
 						var shroud = player?.Shroud;
 						if (shroud != null)
 						{
-							var totalCells = world.Map.AllCells.Count();
-							var exploredCells = world.Map.AllCells.Count(c => shroud.IsExplored(c));
+							// Denominator is the playable rectangle (Map.Bounds), not all map cells.
+							// Map.AllCells includes the 2-cell shroud border outside Bounds; counting
+							// those makes the % exceed 100 (observed up to 108% on rush-hour where
+							// playable=124x36=4464 but raw map=128x40=5120). 100% must mean
+							// 'entire playable region revealed'.
+							var bounds = world.Map.Bounds;
+							var totalCells = bounds.Width * bounds.Height;
+							var exploredCells = 0;
+							for (var y = bounds.Top; y < bounds.Bottom; y++)
+								for (var x = bounds.Left; x < bounds.Right; x++)
+									if (shroud.IsExplored(new CPos(x, y))) exploredCells++;
 							obs.ExploredPercent = totalCells > 0 ? (float)exploredCells / totalCells * 100f : 0f;
 						}
 
+						DrainKillEventsInto(obs);
 						advTcs.TrySetResult(obs);
 					}
 					catch (Exception e)
@@ -592,7 +608,9 @@ namespace OpenRA.Mods.Common.Traits
 		void SnapshotActors()
 		{
 			cachedMobileActors.Clear();
-			if (cachedTotalCells == 0) cachedTotalCells = world.Map.AllCells.Count();
+			// Use playable rectangle, not Map.AllCells (which includes the 2-cell
+			// shroud border around the map and would inflate the explored% denominator).
+			if (cachedTotalCells == 0) cachedTotalCells = world.Map.Bounds.Width * world.Map.Bounds.Height;
 			cachedMobileActors.AddRange(world.ActorsHavingTrait<Mobile>());
 			cachedBuildingActors.Clear();
 			cachedBuildingActors.AddRange(world.ActorsHavingTrait<Building>());
@@ -662,9 +680,13 @@ namespace OpenRA.Mods.Common.Traits
 			var shroudForExplored = player?.Shroud;
 			if (shroudForExplored != null && cachedTotalCells > 0)
 			{
+				// Iterate playable cells only (Map.Bounds), matching the
+				// at-advance-end ExploredPercent calculation.
+				var bounds = world.Map.Bounds;
 				var exploredCells = 0;
-				foreach (var c in world.Map.AllCells)
-					if (shroudForExplored.IsExplored(c)) exploredCells++;
+				for (var y = bounds.Top; y < bounds.Bottom; y++)
+					for (var x = bounds.Left; x < bounds.Right; x++)
+						if (shroudForExplored.IsExplored(new CPos(x, y))) exploredCells++;
 				exploredPct = (float)exploredCells / cachedTotalCells * 100f;
 			}
 
@@ -991,6 +1013,76 @@ namespace OpenRA.Mods.Common.Traits
 				PlayerFaction = playerFaction,
 				EnemyFaction = enemyFaction,
 			};
+		}
+
+		/// <summary>
+		/// Hook called from INotifyKilled (UpdatesPlayerStatistics.Killed) on every actor
+		/// death. Routes the kill event to all bridges whose player was involved (either
+		/// as victim-owner or attacker-owner). Each bridge enqueues its own view of the
+		/// event (victim_is_own / attacker_is_own flags from that bridge's perspective),
+		/// to be drained into the next FastAdvance response.
+		/// </summary>
+		internal static void NotifyKill(Actor victim, AttackInfo attackInfo)
+		{
+			if (victim == null)
+				return;
+
+			// Environmental damage, self-damage, or attacker already gone. We still
+			// record the event (victim will be represented with attacker_actor_id=0)
+			// so that attribution can count the death even if the attacker is unknown.
+			var attacker = attackInfo.Attacker;
+			var attackerIsValid = attacker != null && !attacker.Disposed && attacker != victim;
+
+			var world = victim.World;
+			var victimCell = victim.Location;
+			var attackerCell = attackerIsValid ? attacker.Location : victimCell;
+			var tick = world.WorldTick;
+			var isBuilding = victim.Info.HasTraitInfo<BuildingInfo>();
+
+			var victimType = victim.Info.Name ?? "";
+			var attackerType = attackerIsValid ? (attacker.Info.Name ?? "") : "";
+			var victimActorId = victim.ActorID;
+			var attackerActorId = attackerIsValid ? attacker.ActorID : 0u;
+
+			foreach (var kvp in Sessions)
+			{
+				var bridge = kvp.Value;
+				if (bridge == null)
+					continue;
+				var bridgePlayer = bridge.player;
+				if (bridgePlayer == null)
+					continue;
+				var victimIsOwn = victim.Owner == bridgePlayer;
+				var attackerIsOwn = attackerIsValid && attacker.Owner == bridgePlayer;
+				if (!victimIsOwn && !attackerIsOwn)
+					continue;
+
+				bridge.killEventQueue.Enqueue(new RLProto.RlKillEvent
+				{
+					Tick = tick,
+					VictimActorId = victimActorId,
+					VictimType = victimType,
+					VictimCellX = victimCell.X,
+					VictimCellY = victimCell.Y,
+					AttackerActorId = attackerActorId,
+					AttackerType = attackerType,
+					AttackerCellX = attackerCell.X,
+					AttackerCellY = attackerCell.Y,
+					VictimIsOwn = victimIsOwn,
+					AttackerIsOwn = attackerIsOwn,
+					VictimIsBuilding = isBuilding,
+				});
+			}
+		}
+
+		/// <summary>
+		/// Drain all pending kill events into the outgoing observation. Called from
+		/// FastAdvance response assembly (both normal completion and game-over paths).
+		/// </summary>
+		void DrainKillEventsInto(RLProto.GameObservation obs)
+		{
+			while (killEventQueue.TryDequeue(out var ev))
+				obs.KillEvents.Add(ev);
 		}
 
 		/// <summary>
