@@ -221,5 +221,65 @@ namespace OpenRA.Mods.Common.Traits
 
 			return Task.FromResult(new RLProto.DestroySessionResponse());
 		}
+
+		/// <summary>
+		/// Serialize a running session into an .orasav byte blob.
+		/// </summary>
+		public override Task<RLProto.SaveSnapshotResponse> SaveSnapshot(
+			RLProto.SaveSnapshotRequest request,
+			ServerCallContext context)
+		{
+			if (!ExternalBotBridge.MultiSessionMode)
+				throw new RpcException(new Status(StatusCode.Unimplemented,
+					"SaveSnapshot is only available in multi-session mode"));
+
+			try
+			{
+				var (bytes, lastFrame) = RLSessionManager.SaveSession(request.SessionId);
+				return Task.FromResult(new RLProto.SaveSnapshotResponse
+				{
+					Snapshot = Google.Protobuf.ByteString.CopyFrom(bytes),
+					LastFrame = lastFrame,
+				});
+			}
+			catch (InvalidOperationException e)
+			{
+				throw new RpcException(new Status(StatusCode.NotFound, e.Message));
+			}
+			catch (Exception e)
+			{
+				Log.Write("rl-bridge", $"SaveSnapshot error for session {request.SessionId}: {e}");
+				throw new RpcException(new Status(StatusCode.Internal, e.Message));
+			}
+		}
+
+		/// <summary>
+		/// Create a new session by loading an .orasav byte blob.
+		/// </summary>
+		public override Task<RLProto.LoadSnapshotResponse> LoadSnapshot(
+			RLProto.LoadSnapshotRequest request,
+			ServerCallContext context)
+		{
+			if (!ExternalBotBridge.MultiSessionMode)
+				throw new RpcException(new Status(StatusCode.Unimplemented,
+					"LoadSnapshot is only available in multi-session mode"));
+
+			try
+			{
+				var (sessionId, lastFrame) = RLSessionManager.LoadSession(
+					request.Snapshot.ToByteArray(),
+					request.SessionId);
+				return Task.FromResult(new RLProto.LoadSnapshotResponse
+				{
+					SessionId = sessionId,
+					LastFrame = lastFrame,
+				});
+			}
+			catch (Exception e)
+			{
+				Log.Write("rl-bridge", $"LoadSnapshot error: {e}");
+				throw new RpcException(new Status(StatusCode.Internal, e.Message));
+			}
+		}
 	}
 }

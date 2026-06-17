@@ -365,6 +365,14 @@ namespace OpenRA.Mods.Common.Traits
 			// Building flag (for distinguishing in mixed lists)
 			unit.IsBuilding = actor.Info.HasTraitInfo<BuildingInfo>();
 
+			// Path-blocked signal: true if the unit's last Move finished with
+			// CompleteDestinationBlocked (pathfinder returned empty path — target
+			// is water, cliff, or unreachable behind blockers). Lets the agent
+			// detect stuck units without heuristics.
+			var mobile = actor.TraitOrDefault<Mobile>();
+			if (mobile != null)
+				unit.PathBlocked = mobile.MoveResult == MoveResult.CompleteDestinationBlocked;
+
 			return unit;
 		}
 

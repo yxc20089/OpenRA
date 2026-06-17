@@ -228,6 +228,22 @@ namespace OpenRA.Mods.Common.Traits
 
 			playerStats.DeathsCost += cost;
 
+			// RL bridge: emit kill event BEFORE the self==attacker early-return so
+			// environmental/self-kills are still captured (with attacker_actor_id=0).
+			// Never let a bridge error block stock stats bookkeeping — but log it
+			// so a regression in the bridge is visible instead of silently dropping
+			// attribution events.
+			try
+			{
+				ExternalBotBridge.NotifyKill(self, e);
+			}
+			catch (Exception bridgeErr)
+			{
+				var victimName = self.Info?.Name ?? "?";
+				var worldTick = self.World?.WorldTick ?? -1;
+				Log.Write("rl-bridge", $"NotifyKill threw for victim={victimName} tick={worldTick}: {bridgeErr}");
+			}
+
 			if (e.Attacker == self)
 				return;
 

@@ -22,6 +22,17 @@ service RLBridge {
   // Session management (multi-session mode)
   rpc CreateSession(CreateSessionRequest) returns (CreateSessionResponse);
   rpc DestroySession(DestroySessionRequest) returns (DestroySessionResponse);
+
+  // Snapshot a running session into an .orasav-format byte blob. The
+  // returned bytes can be passed to LoadSnapshot (same process, different
+  // session) to recreate the exact state. Used by expert-anchored GRPO
+  // to fork K samples from the expert's state at a chosen tick.
+  rpc SaveSnapshot(SaveSnapshotRequest) returns (SaveSnapshotResponse);
+
+  // Create a new session by loading an .orasav byte blob produced by a
+  // prior SaveSnapshot. The new session replays the recorded orders and
+  // applies stored trait-data patches to reach the saved tick.
+  rpc LoadSnapshot(LoadSnapshotRequest) returns (LoadSnapshotResponse);
 }
 
 // ─── Observations (Game → Agent) ────────────────────────────────────────────
@@ -63,6 +74,36 @@ message GameObservation {
   bool interrupted = 18;           // true if advance ended early due to interrupt
   string interrupt_reason = 19;    // signal name (e.g. "enemy_spotted")
   int32 actual_ticks_advanced = 20; // ticks actually advanced (may be < requested)
+
+  // Kill events that fired during this advance (authoritative — sourced from
+  // INotifyKilled hook with AttackInfo.Attacker). Drained each FastAdvance.
+  repeated RlKillEvent kill_events = 21;
+}
+
+// Kill event: one per INotifyKilled firing inside the engine. The same
+// event is delivered to both the victim's bridge (as a death) and the
+// attacker's bridge (as a kill) — disambiguated by victim_is_own/attacker_is_own.
+message RlKillEvent {
+  int32 tick = 1;
+  uint32 victim_actor_id = 2;
+  string victim_type = 3;        // e.g. "e1", "1tnk"
+  // Victim CPos (grid cell) at the tick INotifyKilled fired. If the unit was
+  // mid-move between cells, this is the "from" cell (CPos truncates sub-cell
+  // position). Sufficient for reward attribution; not a precise world coord.
+  int32 victim_cell_x = 4;
+  int32 victim_cell_y = 5;
+  // 0 when attacker is unknown — covers both "environmental" damage (lava,
+  // map-scripted explosions, etc.) AND self-damage (unit's own AttackInfo
+  // has Attacker==self). These cases are currently indistinguishable on the
+  // wire; consumers should treat attacker_actor_id=0 as "no attributable
+  // agent". attacker_type is "" in this case.
+  uint32 attacker_actor_id = 6;
+  string attacker_type = 7;
+  int32 attacker_cell_x = 8;     // CPos X (grid) at time of kill
+  int32 attacker_cell_y = 9;
+  bool victim_is_own = 10;       // victim belongs to this bridge's player
+  bool attacker_is_own = 11;     // attacker belongs to this bridge's player
+  bool victim_is_building = 12;
 }
 
 message RlEconomy {
@@ -110,6 +151,13 @@ message RlUnitInfo {
   int32 attack_range = 17;     // Max attack range in WDist units
   int32 passenger_count = 18;  // Cargo count (0 if not transport, -1 if N/A)
   bool is_building = 19;       // false for units (helps distinguish in visible_enemies)
+
+  // True if the unit's most recent Move activity finished with
+  // CompleteDestinationBlocked — pathfinder returned no path to the
+  // commanded cell (water/cliff/blockers). Lets agents detect stuck
+  // units without position-delta heuristics. Stays false while a move
+  // is in progress or when the last move completed successfully.
+  bool path_blocked = 20;
 }
 
 message RlBuildingInfo {
@@ -239,3 +287,32 @@ message DestroySessionRequest {
 }
 
 message DestroySessionResponse {}
+
+// ─── Snapshot / Restore (Multi-Session Mode) ────────────────────────────────
+
+message SaveSnapshotRequest {
+  string session_id = 1;
+}
+
+message SaveSnapshotResponse {
+  // .orasav-format bytes capturing the session's full order stream +
+  // lobby metadata + per-trait state.
+  bytes snapshot = 1;
+  // Last frame number the snapshot covers (for debugging / logging).
+  int32 last_frame = 2;
+}
+
+message LoadSnapshotRequest {
+  // .orasav-format bytes from a prior SaveSnapshot call.
+  bytes snapshot = 1;
+  // Optional requested session_id for the new loaded session. If empty,
+  // a fresh UUID is assigned.
+  string session_id = 2;
+}
+
+message LoadSnapshotResponse {
+  // Actual session_id assigned to the loaded session.
+  string session_id = 1;
+  // Frame the loaded session reached after applying the snapshot.
+  int32 last_frame = 2;
+}
